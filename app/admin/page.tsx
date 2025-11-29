@@ -1,12 +1,135 @@
 "use client";
 
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { fetchReports } from "@/lib/api";
+import {
+  fetchReports,
+  ReportRecord,
+  ReportStatus,
+  updateReportStatus,
+  deleteReportById,
+} from "@/lib/api";
 import { Shield, Lock, MapPin } from "lucide-react";
+
+type ProcessedReport = ReportRecord & {
+  id: string;
+  mapsLink: string;
+  status: ReportStatus;
+  rowNumber: number;
+};
+
+const STATUS_LABELS: Record<ReportStatus, string> = {
+  [ReportStatus.Pending]: "Pending",
+  [ReportStatus.Investigating]: "Investigasi",
+  [ReportStatus.Resolved]: "Selesai",
+};
+
+const STATUS_STYLES: Record<ReportStatus, string> = {
+  [ReportStatus.Pending]: "bg-amber-100 text-amber-800",
+  [ReportStatus.Investigating]: "bg-blue-100 text-blue-700",
+  [ReportStatus.Resolved]: "bg-emerald-100 text-emerald-700",
+};
+
+const STATUS_OPTIONS = Object.entries(STATUS_LABELS).map(([value, label]) => ({
+  value: value as ReportStatus,
+  label,
+}));
+
+const resolveReportId = (report: ReportRecord, fallbackIndex: number) => {
+  const candidate =
+    report.id ?? report.Id ?? report.ID ?? report.rowNumber ?? report.RowNumber ?? report.timestamp ?? report.createdAt;
+  return String(candidate ?? `row-${fallbackIndex}`);
+};
+
+
+type ReportCardProps = {
+  report: ProcessedReport;
+  index: number;
+  onStatusChange: (id: string, rowNumber: number, status: ReportStatus) => void;
+  onDelete: (id: string, rowNumber: number) => void;
+  statusUpdatingId: string | null;
+  deletingId: string | null;
+};
+
+const ReportCard = memo(function ReportCard({
+  report,
+  index,
+  onStatusChange,
+  onDelete,
+  statusUpdatingId,
+  deletingId,
+}: ReportCardProps) {
+  const isStatusUpdating = statusUpdatingId === report.id;
+  const isDeleting = deletingId === report.id;
+
+  return (
+    <Card key={index} className="overflow-hidden shadow-md hover:shadow-lg transition-shadow border border-zinc-200">
+      <CardHeader className="flex flex-col gap-3 border-b border-zinc-200 bg-gradient-to-r from-white to-zinc-50/50 p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="space-y-2 flex-1">
+            <p className="text-sm font-semibold text-zinc-900 leading-relaxed">
+              {report.Description || report.description || "Tanpa deskripsi"}
+            </p>
+            <div className="flex flex-col gap-1">
+              <p className="text-xs text-zinc-600">
+                <span className="font-medium">Pelapor:</span> {report.Name || report.name || "Anonim"}
+              </p>
+              {report.Phone || report.phone ? (
+                <p className="text-xs text-zinc-600">
+                  <span className="font-medium">HP:</span> {report.Phone || report.phone}
+                </p>
+              ) : null}
+            </div>
+            {report.mapsLink && (
+              <a
+                href={report.mapsLink}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 text-xs font-medium text-[#D60000] hover:text-[#b20000] hover:underline transition-colors"
+              >
+                <MapPin className="w-3.5 h-3.5" />
+                Lihat Lokasi di Google Maps
+              </a>
+            )}
+          </div>
+          <div className="flex flex-col items-end gap-2.5">
+            <span className={`rounded-full px-3 py-1 text-xs font-semibold shadow-sm ${STATUS_STYLES[report.status]}`}>
+              {STATUS_LABELS[report.status]}
+            </span>
+            <select
+              className="w-36 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs text-zinc-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-[#D60000] focus:border-[#D60000] transition-all"
+              value={report.status}
+              onChange={(e) => onStatusChange(report.id, report.rowNumber, e.target.value as ReportStatus)}
+              disabled={isStatusUpdating}
+            >
+              {STATUS_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="text-xs text-red-600 hover:bg-red-50 hover:text-red-700 font-medium"
+              disabled={isDeleting}
+              onClick={() => {
+                console.log('Delete clicked for report:', { id: report.id, rowNumber: report.rowNumber, report });
+                onDelete(report.id, report.rowNumber);
+              }}
+            >
+              {isDeleting ? "Menghapus..." : "Hapus"}
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+    </Card>
+  );
+});
 
 const ADMIN_PASSWORD = process.env.NEXT_PUBLIC_ADMIN_PASSWORD as string | undefined;
 
@@ -15,7 +138,73 @@ export default function AdminPage() {
   const [authorized, setAuthorized] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [reports, setReports] = useState<any[]>([]);
+  const [reports, setReports] = useState<ReportRecord[]>([]);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [statusUpdatingId, setStatusUpdatingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  const processedReports = useMemo<ProcessedReport[]>(
+    () =>
+      reports.map((report, idx) => {
+        const statusCandidate = (report.status || report.Status || report.currentStatus) as ReportStatus | undefined;
+        const validStatus = Object.values(ReportStatus).includes(statusCandidate as ReportStatus)
+          ? (statusCandidate as ReportStatus)
+          : ReportStatus.Pending;
+
+        const resolvedRowNumberCandidate =
+          report.rowNumber ?? report.RowNumber ?? report.row ?? report.row_index ?? null;
+        let resolvedRowNumber: number;
+        
+        if (typeof resolvedRowNumberCandidate === "number") {
+          resolvedRowNumber = resolvedRowNumberCandidate;
+        } else if (resolvedRowNumberCandidate !== null && resolvedRowNumberCandidate !== undefined) {
+          resolvedRowNumber = Number(resolvedRowNumberCandidate);
+        } else {
+          resolvedRowNumber = NaN;
+        }
+
+        // Pastikan rowNumber selalu >= 2 (row 1 adalah header)
+        // Jika rowNumber tidak valid atau < 2, gunakan idx + 2 sebagai fallback
+        const finalRowNumber = (Number.isFinite(resolvedRowNumber) && resolvedRowNumber >= 2) 
+          ? resolvedRowNumber 
+          : idx + 2;
+
+        return {
+          ...report,
+          id: resolveReportId(report, idx),
+          mapsLink: (report.GoogleMapsLink || report.googleMapsLink || "") as string,
+          status: validStatus,
+          rowNumber: finalRowNumber,
+        };
+      }),
+    [reports]
+  );
+
+  const fetchAndSetReports = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await fetchReports();
+      console.log('Fetched reports:', data);
+      // Log rowNumber untuk setiap report
+      data.forEach((report, idx) => {
+        console.log(`Report ${idx}:`, {
+          rowNumber: report.rowNumber,
+          RowNumber: report.RowNumber,
+          row: report.row,
+          row_index: report.row_index,
+          name: report.Name || report.name,
+        });
+      });
+      setReports(data);
+      setSuccess(null);
+    } catch (err: any) {
+      setError(err?.message || "Gagal mengambil data laporan.");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -31,17 +220,106 @@ export default function AdminPage() {
       return;
     }
 
+    await fetchAndSetReports();
+    setAuthorized(true);
+  };
+
+  const handleStatusChange = async (reportId: string, rowNumber: number, status: ReportStatus) => {
+    setStatusUpdatingId(reportId);
+    setError(null);
+    setSuccess(null);
     try {
-      setLoading(true);
-      const data = await fetchReports();
-      setReports(data);
-      setAuthorized(true);
+      await updateReportStatus(rowNumber, status);
+      // Refresh data dari server untuk memastikan data terbaru
+      await fetchAndSetReports();
+      setSuccess("Status laporan berhasil diperbarui.");
     } catch (err: any) {
-      setError(err?.message || "Gagal mengambil data laporan.");
+      setError(err?.message || "Gagal memperbarui status laporan.");
+      // Tetap refresh data meskipun ada error untuk sinkronisasi
+      await fetchAndSetReports();
     } finally {
-      setLoading(false);
+      setStatusUpdatingId(null);
     }
   };
+
+  const handleDelete = async (reportId: string, rowNumber: number) => {
+    if (!confirm("Hapus laporan ini? Tindakan tidak dapat dibatalkan.")) {
+      return;
+    }
+
+    setDeletingId(reportId);
+    setError(null);
+    setSuccess(null);
+    
+    // Validasi rowNumber - pastikan valid dan >= 2
+    if (!rowNumber || isNaN(rowNumber) || rowNumber < 2) {
+      const errorMsg = `Row number tidak valid: ${rowNumber}. Row number harus >= 2.`;
+      console.error('Invalid rowNumber:', { reportId, rowNumber });
+      setError(errorMsg);
+      setDeletingId(null);
+      return;
+    }
+    
+    // Cari report yang akan dihapus untuk logging
+    const reportToDelete = processedReports.find(r => r.id === reportId);
+    console.log('Deleting report:', { 
+      reportId, 
+      rowNumber, 
+      report: reportToDelete,
+      allProcessedReports: processedReports.map(r => ({ id: r.id, rowNumber: r.rowNumber }))
+    });
+    
+    // Optimistically remove dari UI dulu
+    const previousReports = [...reports];
+    setReports((prev) => prev.filter((report, idx) => resolveReportId(report, idx) !== reportId));
+    
+    try {
+      console.log('Calling deleteReportById with rowNumber:', rowNumber);
+      const result = await deleteReportById(rowNumber);
+      console.log('Delete result:', result);
+      
+      if (!result.success) {
+        // Jika gagal, kembalikan data sebelumnya
+        setReports(previousReports);
+        setError(result.message || "Gagal menghapus laporan.");
+        return;
+      }
+      
+      // Tunggu sebentar sebelum refresh untuk memastikan Apps Script selesai
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // Refresh data dari server untuk memastikan sinkronisasi
+      await fetchAndSetReports();
+      setSuccess("Laporan berhasil dihapus.");
+    } catch (err: any) {
+      // Jika error, kembalikan data sebelumnya
+      setReports(previousReports);
+      console.error('Delete error:', err);
+      setError(err?.message || "Gagal menghapus laporan.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const filteredReports = useMemo(() => {
+    if (!searchTerm.trim()) {
+      return processedReports;
+    }
+
+    const query = searchTerm.toLowerCase();
+    return processedReports.filter((report) => {
+      const fields = [
+        report.Description,
+        report.description,
+        report.Name,
+        report.name,
+        report.Phone,
+        report.phone,
+        report.mapsLink,
+      ];
+      return fields.some((field) => typeof field === "string" && field.toLowerCase().includes(query));
+    });
+  }, [processedReports, searchTerm]);
 
   if (!authorized) {
     return (
@@ -91,68 +369,65 @@ export default function AdminPage() {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-50 px-3 py-4">
-      <div className="mx-auto flex max-w-md flex-col gap-3">
-        <div className="flex items-center justify-between">
-          <h1 className="text-lg font-semibold text-zinc-900">Dashboard Laporan</h1>
-          <span className="text-xs text-zinc-500">Total: {reports.length}</span>
+    <div className="min-h-screen bg-zinc-50">
+      <header className="sticky top-0 z-20 bg-gradient-to-r from-[#D60000] via-[#ff3b3b] to-[#D60000] text-white shadow-md">
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:gap-4">
+          <div className="flex flex-1 flex-col">
+            <p className="text-base font-bold text-white">Dashboard Laporan</p>
+            <span className="text-xs text-white/90">Total laporan: {reports.length}</span>
+          </div>
+          <div className="flex flex-1 items-center gap-2">
+            <Input
+              placeholder="Cari nama, deskripsi, atau nomor HP"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="text-sm bg-white/95 border-white/20 focus:bg-white"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={loading}
+              onClick={fetchAndSetReports}
+              className="bg-white/10 border-white/30 text-white hover:bg-white/20"
+            >
+              {loading ? "Muat..." : "Refresh"}
+            </Button>
+          </div>
         </div>
+      </header>
 
-        <div className="flex flex-col gap-3">
-          {reports.length === 0 && (
-            <p className="text-xs text-zinc-500">Belum ada laporan.</p>
-          )}
-
-          {reports.map((report, idx) => {
-            const imageUrl = report.ImageUrl1 || report.ImageUrl2 || report.ImageUrl3 || "";
-            const mapsLink = report.GoogleMapsLink || report.googleMapsLink || "";
-
-            return (
-              <Card key={idx} className="overflow-hidden">
-                <CardContent className="p-3 flex flex-col gap-2">
-                  {imageUrl && (
-                    <a
-                      href={imageUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="block h-40 w-full overflow-hidden rounded-md bg-zinc-100"
-                    >
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img
-                        src={imageUrl}
-                        alt="Bukti laporan"
-                        className="h-full w-full object-cover"
-                      />
-                    </a>
-                  )}
-                  <div className="space-y-1">
-                    <p className="text-sm font-semibold text-zinc-900">
-                      {report.Description || report.description || "Tanpa deskripsi"}
-                    </p>
-                    <p className="text-xs text-zinc-500">
-                      Pelapor: {report.Name || report.name || "Anonim"}
-                      {report.Phone || report.phone
-                        ? ` • HP: ${report.Phone || report.phone}`
-                        : ""}
-                    </p>
-                    {mapsLink && (
-                      <a
-                        href={mapsLink}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 text-xs font-medium text-[#D60000] hover:underline"
-                      >
-                        <MapPin className="w-3 h-3" />
-                        Lihat Lokasi
-                      </a>
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
-            );
-          })}
-        </div>
-      </div>
+      <main className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-4">
+        {(error || success) && (
+          <Alert 
+            variant={error ? "destructive" : "default"}
+            className={success ? "bg-emerald-50 border-emerald-200 text-emerald-800" : ""}
+          >
+            <AlertDescription className={success ? "text-emerald-800 font-medium" : ""}>
+              {error || success}
+            </AlertDescription>
+          </Alert>
+        )}
+        {filteredReports.length === 0 ? (
+          <p className="rounded-md border border-dashed border-zinc-200 bg-white px-4 py-6 text-center text-sm text-zinc-500">
+            {processedReports.length === 0
+              ? "Belum ada laporan."
+              : "Tidak ada laporan yang cocok dengan pencarian."}
+          </p>
+        ) : (
+          filteredReports.map((report, idx) => (
+            <ReportCard
+              key={report.id}
+              report={report}
+              index={idx}
+              onStatusChange={handleStatusChange}
+              onDelete={handleDelete}
+              statusUpdatingId={statusUpdatingId}
+              deletingId={deletingId}
+            />
+          ))
+        )}
+      </main>
     </div>
   );
 }
